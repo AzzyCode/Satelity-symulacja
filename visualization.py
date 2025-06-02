@@ -10,6 +10,7 @@ from cartopy.feature.nightshade import Nightshade
 from shapely.geometry import box, MultiPolygon
 from shapely.ops import unary_union
 from matplotlib.patheffects import withStroke
+from skyfield.api import load, wgs84
 from config import (
     reception_stations,
     use_custom_map,
@@ -24,7 +25,6 @@ from config import (
     SATELLITE_PHOTO_SIZES_MB,
     satellites as SATELLITE_CONFIG  # Import SATELLITE_CONFIG
 )
-
 
 def plot_static(satellites, sky_datetime_objects):
     fig = plt.figure(figsize=(16, 9))
@@ -226,16 +226,21 @@ def animate_coverage(satellites, sky_datetime_objects):
                 return 'land'
         return 'ocean'
 
+    ts = load.timescale()
+    eph = load('de421.bsp')  # Load the planetary ephemeris once
+
     def animate(frame):
         nonlocal day_land, day_ocean
         ax.clear()
         ax.set_global()
 
-        t = sky_datetime_objects[frame]
-        # build nightshade feature and get its geometries
-        ns = Nightshade(t, alpha=0)
-        night_polys = list(ns.geometries())
-        ax.add_feature(Nightshade(t, alpha=0.3), zorder=1)
+        current_time_utc = sky_datetime_objects[frame]
+        t_sky = ts.utc(current_time_utc) # Use the passed ts object
+
+        # build nightshade feature - keep for visual representation
+        ns = Nightshade(current_time_utc, alpha=0) # Use current_time_utc
+        night_polys_visual = list(ns.geometries()) # For visual display only
+        ax.add_feature(Nightshade(current_time_utc, alpha=0.3), zorder=1) # Use current_time_utc
 
         # background
         if use_custom_map:
@@ -324,10 +329,27 @@ def animate_coverage(satellites, sky_datetime_objects):
                 if PHOTO_COUNTING_MODE == 'DAY_AND_NIGHT':
                     should_count_photo_this_frame = True
                 elif PHOTO_COUNTING_MODE == 'DAY_ONLY':
-                    cen_fov = curr.centroid
-                    # Reverting to the original logic for day detection:
-                    # It is day if the centroid is NOT in any of the night polygons.
-                    is_day_at_fov = not any(night_poly.contains(cen_fov) for night_poly in night_polys)
+                    # --- NOWA LOGIKA OKREŚLANIA DNIA/NOCY ---
+                    # Pobierz współrzędne środka FOV lub bezpośrednio subpointu satelity
+                    # Dla uproszczenia użyjemy subpoint satelity, który już masz
+                    sat_lat = lats[frame]
+                    sat_lon = lons[frame]
+                    
+                    # Utwórz obiekt GeographicPosition dla subpointu satelity
+                    # wgs84 jest już importowane na górze pliku
+                    subpoint = wgs84.latlon(sat_lat, sat_lon)
+                    
+                    # Oblicz pozycję Słońca względem Ziemi
+                    earth_observer = eph['earth'] + subpoint 
+                    
+                    # Obserwuj Słońce z subpointu na Ziemi
+                    # eph jest przekazywane do animate_coverage
+                    sun_astrometric = earth_observer.at(t_sky).observe(eph['sun'])
+                    alt, az, distance = sun_astrometric.apparent().altaz() # Domyślne parametry dla refrakcji są OK
+
+                    is_day_at_fov = alt.degrees > 0 # Słońce jest nad horyzontem
+                    # --- KONIEC NOWEJ LOGIKI OKREŚLANIA DNIA/NOCY ---
+                    
                     if is_day_at_fov:
                         should_count_photo_this_frame = True
                 
@@ -336,16 +358,24 @@ def animate_coverage(satellites, sky_datetime_objects):
                     cumulative_data_volumes_mb[name] += photo_size_mb
 
                 # Oryginalna logika zliczania zdjęć dziennych nad lądem/oceanem
-                cen_day_counter = curr.centroid # Same centroid as cen_fov
-                
-                # Reverting to the original logic for the separate day_land/day_ocean counters:
-                # It is day if the centroid is NOT in any of the night polygons.
-                is_day_for_these_counters = not any(n.contains(cen_day_counter) for n in night_polys)
-
-                if is_day_for_these_counters: # If it is day at the centroid
+                # Możemy ją również zaktualizować, aby korzystała z nowej metody, jeśli chcesz
+                # Na razie zostawmy ją, aby porównać wyniki, lub zaktualizujmy:
+                if is_day_at_fov: # Użyj nowego warunku
                     surf = classify_surface(curr)
-                    if surf == 'land': day_land += 1
-                    else: day_ocean += 1
+                    if surf == 'land': 
+                        day_land += 1
+                    else:           
+                        day_ocean += 1
+                # Jeśli nie chcesz już starych liczników day_land/day_ocean opartych na Nightshade,
+                # możesz usunąć poniższy blok:
+                # cen = curr.centroid 
+                # in_night = any(n.contains(cen) for n in night_polys_visual) # Użyj night_polys_visual
+                # if not in_night:
+                #     surf = classify_surface(curr)
+                #     if surf == 'land': 
+                #         day_land += 1
+                #     else:           
+                #         day_ocean += 1
 
         # reception stations
         for st in reception_stations.values():
@@ -400,7 +430,7 @@ def animate_coverage(satellites, sky_datetime_objects):
                 bbox=dict(boxstyle='round,pad=0.2', fc='lightgray', alpha=background_alpha, ec='none') # Tło dla tekstu
             )
         
-        ax.set_title(f"Satellite Simulation: {t.strftime('%Y-%m-%d %H:%M:%S')} UTC", fontsize=10)
+        ax.set_title(f"Satellite Simulation: {current_time_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC", fontsize=10)
         return []
 
     anim = FuncAnimation(fig, animate, frames=num_steps, interval=1000/animation_fps, blit=False)
